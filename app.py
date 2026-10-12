@@ -4,9 +4,13 @@ import contextlib
 import io
 import tempfile
 import re
+import time
+import threading
+import queue
 
 import pandas as pd
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 from hansard_scraper import (
     DIRECT_KEYWORDS,
@@ -16,13 +20,40 @@ from hansard_scraper import (
 )
 
 
+class QueueStream:
+    """Redirects terminal output to a thread-safe queue."""
+    def __init__(self, log_queue):
+        self.log_queue = log_queue
+
+    def write(self, text):
+        if text:
+            self.log_queue.put(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def background_scraper(kwargs, log_queue, result_dict):
+    """Runs the heavy scraping task in a separate thread so the web UI doesn't freeze."""
+    qs = QueueStream(log_queue)
+    try:
+        with contextlib.redirect_stdout(qs), contextlib.redirect_stderr(qs):
+            run_scraper(**kwargs)
+        result_dict["status"] = "success"
+    except Exception as exc:
+        result_dict["status"] = "error"
+        result_dict["error"] = exc
+
+
 class SmartProgressUI:
+    """Tracks overall MP completion and fragment downloads cleanly."""
     def __init__(self, placeholder, total_mps):
         self.placeholder = placeholder
         self.total_mps = max(1, total_mps)
         self.current_mp_index = 0
         with self.placeholder.container():
-            self.overall_bar = st.progress(0.0, text="Starting search...")
+            self.overall_bar = st.progress(0.0, text="Starting background task...")
             self.status_box = st.info("Initializing search engine...")
             self.detail_caption = st.caption("Querying NSW Hansard...")
         self.log_lines = []
@@ -60,7 +91,6 @@ class SmartProgressUI:
                 sub_progress = min(1.0, c / t)
                 self.detail_caption.caption(f"Downloading fragments: {c:,} of {t:,}")
 
-        # Compute safe percentage using split lines
         completed_mps = max(0, self.current_mp_index - 1)
         base_pct = completed_mps / self.total_mps
         step_pct = (1.0 / self.total_mps) * sub_progress
@@ -71,9 +101,6 @@ class SmartProgressUI:
             overall_pct,
             text=f"Progress: {int(overall_pct * 100)}% ({self.current_mp_index}/{self.total_mps} MPs)",
         )
-
-    def flush(self):
-        pass
 
     def complete(self):
         self.overall_bar.progress(1.0, text="Search complete!")
@@ -86,7 +113,7 @@ class SmartProgressUI:
 
 st.set_page_config(page_title="NSW Hansard Research Tool", page_icon="🏛️", layout="wide")
 st.title("NSW Hansard Research Tool")
-st.caption("Configure the search, run the Hansard scraper, and download an Excel workbook.")
+st.caption("Configure the search, run the Hansard scraper in the background, and download an Excel workbook.")
 
 
 @st.cache_data
@@ -150,9 +177,9 @@ with st.expander("Advanced settings"):
     max_workers = st.slider(
         "Concurrent fragment requests",
         min_value=1,
-        max_value=10,
-        value=6,
-        help="Higher values download fragments faster.",
+        max_value=6,
+        value=3,
+        help="Reduced to 3 to prevent server connection drops on Streamlit Cloud.",
     )
     show_preview = st.checkbox("Show a preview of extracted quotes", value=True)
     include_audit = st.checkbox("Include speaker-label audit in workbook", value=True)
@@ -196,19 +223,36 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True, d
         progress_placeholder = st.empty()
         ui = SmartProgressUI(progress_placeholder, total_mps=len(selected_names))
 
-        try:
-            with contextlib.redirect_stdout(ui), contextlib.redirect_stderr(ui):
-                run_scraper(
-                    start=start_date.isoformat(),
-                    end=end_date.isoformat(),
-                    mps_file=str(mps_path),
-                    out_file=str(quotes_path),
-                    audit_file=str(audit_path),
-                    selected_mps=selected_names,
-                    keywords=keywords,
-                    max_workers=max_workers,
-                )
+        # Setup background thread to prevent UI freezing
+        log_queue = queue.Queue()
+        result_dict = {}
+        kwargs = {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "mps_file": str(mps_path),
+            "out_file": str(quotes_path),
+            "audit_file": str(audit_path),
+            "selected_mps": selected_names,
+            "keywords": keywords,
+            "max_workers": max_workers,
+        }
 
+        # Start the background task
+        thread = threading.Thread(target=background_scraper, args=(kwargs, log_queue, result_dict))
+        add_script_run_ctx(thread)
+        thread.start()
+
+        # Keep the main thread alive and updating the UI while the background thread works
+        while thread.is_alive():
+            while not log_queue.empty():
+                ui.write(log_queue.get())
+            time.sleep(0.5)
+
+        # Flush any final logs after the thread finishes
+        while not log_queue.empty():
+            ui.write(log_queue.get())
+
+        if result_dict.get("status") == "success":
             ui.complete()
 
             df = pd.read_csv(quotes_path) if quotes_path.exists() else pd.DataFrame()
@@ -225,22 +269,12 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True, d
             settings_df = pd.DataFrame(
                 {
                     "Setting": [
-                        "Start date",
-                        "End date",
-                        "MPs searched",
-                        "Chambers",
-                        "Direct keywords enabled",
-                        "Euphemism keywords enabled",
-                        "Concurrent requests",
+                        "Start date", "End date", "MPs searched", "Chambers",
+                        "Direct keywords enabled", "Euphemism keywords enabled", "Concurrent requests",
                     ],
                     "Value": [
-                        start_date.isoformat(),
-                        end_date.isoformat(),
-                        "; ".join(selected_names),
-                        "; ".join(chambers),
-                        str(use_direct),
-                        str(use_euphemisms),
-                        max_workers,
+                        start_date.isoformat(), end_date.isoformat(), "; ".join(selected_names), "; ".join(chambers),
+                        str(use_direct), str(use_euphemisms), max_workers,
                     ],
                 }
             )
@@ -263,8 +297,8 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True, d
             with st.expander("Show detailed scraper log"):
                 st.text(ui.get_logs()[-20000:])
 
-        except Exception as exc:
+        else:
             st.error("The scraper encountered an unexpected error.")
-            st.exception(exc)
+            st.exception(result_dict.get("error"))
             with st.expander("Show detailed scraper log"):
                 st.text(ui.get_logs()[-20000:])
