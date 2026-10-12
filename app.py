@@ -16,28 +16,33 @@ from hansard_scraper import (
 
 
 class LiveLog:
-    """Stream scraper stdout into a visible Streamlit log panel."""
+    """Show readable, frequently refreshed scraper output in Streamlit."""
     def __init__(self, placeholder, max_lines=35):
         self.placeholder = placeholder
         self.max_lines = max_lines
         self.buffer = ""
         self.lines = []
 
+    def _render(self):
+        visible = self.lines[-self.max_lines:]
+        if self.buffer:
+            visible = (visible + [self.buffer])[-self.max_lines:]
+        self.placeholder.code("\n".join(visible) or "Waiting for scraper output…", language=None)
+
     def write(self, text):
         if not text:
-            return
-        self.buffer += str(text)
-        while "\\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\\n", 1)
-            self.lines.append(line)
-            self.placeholder.code("\\n".join(self.lines[-self.max_lines:]), language=None)
+            return 0
+        # Streamlit's code display must receive real newlines, not literal \n text.
+        self.buffer += str(text).replace("\r", "")
+        parts = self.buffer.split("\n")
+        self.lines.extend(parts[:-1])
+        self.buffer = parts[-1]
+        # Refresh even for progress messages written with end="" (e.g. [260/462]).
+        self._render()
         return len(text)
 
     def flush(self):
-        if self.buffer:
-            self.lines.append(self.buffer)
-            self.buffer = ""
-            self.placeholder.code("\\n".join(self.lines[-self.max_lines:]), language=None)
+        self._render()
 
 
 st.set_page_config(page_title="NSW Hansard Research Tool", page_icon="🏛️", layout="wide")
@@ -182,7 +187,7 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                     max_workers=max_workers,
                 )
             live_log.flush()
-            log_stream.write("\\n".join(live_log.lines))
+            log_stream.write("\n".join(live_log.lines))
             status.update(label="Search complete", state="complete", expanded=False)
             df = pd.read_csv(quotes_path) if quotes_path.exists() else pd.DataFrame()
             audit_df = pd.read_csv(audit_path) if audit_path.exists() and include_audit else pd.DataFrame()
@@ -216,10 +221,10 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                 use_container_width=True,
             )
             with st.expander("Run log and diagnostics"):
-                st.text("\\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
+                st.text("\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
         except Exception as exc:
             status.update(label="Search failed", state="error", expanded=True)
             st.error("The scraper encountered an error. Review the details below.")
             st.exception(exc)
             with st.expander("Captured run log"):
-                st.text("\\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
+                st.text("\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
