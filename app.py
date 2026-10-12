@@ -32,12 +32,25 @@ class LiveLog:
     def write(self, text):
         if not text:
             return 0
+        
         # Streamlit's code display must receive real newlines, not literal \n text.
-        self.buffer += str(text).replace("\\n", "\n").replace("\r", "")
-        parts = self.buffer.split("\n")
-        self.lines.extend(parts[:-1])
-        self.buffer = parts[-1]
-        # Refresh even for progress messages written with end="" (e.g. [260/462]).
+        text_str = str(text).replace("\\n", "\n")
+        parts = text_str.split("\n")
+        
+        for i, part in enumerate(parts):
+            if "\r" in part:
+                # \r means return to the start of the line. 
+                # We overwrite the buffer with whatever comes after the last \r
+                self.buffer = part.split("\r")[-1]
+            else:
+                self.buffer += part
+            
+            # If this is not the last chunk, it means there was a \n
+            if i < len(parts) - 1:
+                self.lines.append(self.buffer)
+                self.buffer = ""
+                
+        # Refresh even for progress messages
         self._render()
         return len(text)
 
@@ -63,8 +76,7 @@ display_to_name = dict(zip(mp_df["display"], mp_df["search_name"]))
 
 with st.sidebar:
     st.header("Search settings")
-    start_date = st.date_input("Start date", value=date(2023, 3, 1)
-    )
+    start_date = st.date_input("Start date", value=date(2023, 3, 1))
     end_date = st.date_input("End date", value=date(2026, 9, 24))
     chambers = st.multiselect(
         "Chambers",
@@ -172,54 +184,11 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
             "searched and whether fragments are being downloaded. If the log stops on an API request, "
             "check the deployment logs for a timeout or API error."
         )
-        # Persistent progress dashboard: it updates every second, even while the API is
-        # slow and no new fragment has finished downloading.
-        progress_heading = st.empty()
-        progress_bar = st.progress(0.0, text="Preparing search…")
-        status_cols = st.columns(4)
-        metric_mp = status_cols[0].empty()
-        metric_fragments = status_cols[1].empty()
-        metric_inflight = status_cols[2].empty()
-        metric_stalled = status_cols[3].empty()
         live_log_area = st.empty()
         live_log = LiveLog(live_log_area)
-
-        def update_progress(info):
-            phase = info.get("phase", "working")
-            mp_index = int(info.get("mp_index", 0) or 0)
-            mp_total = int(info.get("mp_total", len(selected_names)) or len(selected_names))
-            mp_name = info.get("mp_name", "Starting…")
-            completed = int(info.get("completed", 0) or 0)
-            total = int(info.get("total", 0) or 0)
-            in_flight = int(info.get("in_flight", 0) or 0)
-            errors = int(info.get("errors", 0) or 0)
-            if phase == "downloading" and total:
-                local_fraction = completed / total
-                overall_fraction = ((max(mp_index - 1, 0)) + local_fraction) / max(mp_total, 1)
-                progress_bar.progress(min(overall_fraction, 0.999), text=f"MP {mp_index}/{mp_total} · {mp_name} · {completed:,}/{total:,} fragments")
-                progress_heading.markdown(f"### Downloading fragments for **{mp_name}**")
-                metric_mp.metric("MP progress", f"{mp_index}/{mp_total}")
-                metric_fragments.metric("Fragments", f"{completed:,}/{total:,}", f"{errors} failed/empty" if errors else None)
-                metric_inflight.metric("Requests in flight", f"{in_flight:,}")
-                stalled = int(info.get("seconds_since_progress", 0) or 0)
-                metric_stalled.metric("Since last completion", f"{stalled}s", "Check API if this grows" if stalled >= 30 else None)
-            elif phase == "mp_complete":
-                fraction = mp_index / max(mp_total, 1)
-                progress_bar.progress(min(fraction, 0.999), text=f"Completed MP {mp_index}/{mp_total} · {mp_name}")
-                progress_heading.markdown(f"### Completed **{mp_name}** · {info.get('quotes', 0):,} matching quotes")
-                metric_mp.metric("MP progress", f"{mp_index}/{mp_total}")
-                metric_fragments.metric("Fragments", f"{completed:,}/{total:,}")
-                metric_inflight.metric("Requests in flight", "0")
-                metric_stalled.metric("Fragment errors/empty", f"{errors:,}")
-            else:
-                progress_heading.markdown(f"### Searching **{mp_name}** · MP {mp_index}/{mp_total}")
-                metric_mp.metric("MP progress", f"{mp_index}/{mp_total}")
-                metric_fragments.metric("Fragments", "Searching…")
-                metric_inflight.metric("Requests in flight", "—")
-                metric_stalled.metric("Status", "Contacting API")
-
         try:
-            with contextlib.redirect_stdout(live_log):
+            # Capturing both stdout and stderr (where progress bars usually print)
+            with contextlib.redirect_stdout(live_log), contextlib.redirect_stderr(live_log):
                 run_scraper(
                     start=start_date.isoformat(),
                     end=end_date.isoformat(),
@@ -229,12 +198,9 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                     selected_mps=selected_names,
                     keywords=keywords,
                     max_workers=max_workers,
-                    progress_callback=update_progress,
                 )
             live_log.flush()
             log_stream.write("\n".join(live_log.lines))
-            progress_bar.progress(1.0, text="Search and export complete")
-            progress_heading.markdown("### Search complete — workbook ready")
             status.update(label="Search complete", state="complete", expanded=False)
             df = pd.read_csv(quotes_path) if quotes_path.exists() else pd.DataFrame()
             audit_df = pd.read_csv(audit_path) if audit_path.exists() and include_audit else pd.DataFrame()
