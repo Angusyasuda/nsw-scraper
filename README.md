@@ -18,3 +18,10 @@ A Streamlit web interface around the existing NSW Hansard wage-policy scraper.
 - Download an Excel workbook with Quotes, Search settings, Keywords used, and optional Speaker audit tabs.
 
 The app applies settings at runtime rather than rewriting its own Python source code. Verify results against the original notebook before relying on them for research.
+
+
+## Live progress version
+
+The app streams scraper output while it runs, so users can see the current MP, API search attempts,
+fragment counts, and API errors instead of seeing only a static connecting message.
+If a run stalls, inspect the app's Manage app / Logs page in Streamlit Community Cloud.

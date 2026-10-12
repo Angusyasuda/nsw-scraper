@@ -14,6 +14,32 @@ from hansard_scraper import (
     run_scraper,
 )
 
+
+class LiveLog:
+    """Stream scraper stdout into a visible Streamlit log panel."""
+    def __init__(self, placeholder, max_lines=35):
+        self.placeholder = placeholder
+        self.max_lines = max_lines
+        self.buffer = ""
+        self.lines = []
+
+    def write(self, text):
+        if not text:
+            return
+        self.buffer += str(text)
+        while "\\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\\n", 1)
+            self.lines.append(line)
+            self.placeholder.code("\\n".join(self.lines[-self.max_lines:]), language=None)
+        return len(text)
+
+    def flush(self):
+        if self.buffer:
+            self.lines.append(self.buffer)
+            self.buffer = ""
+            self.placeholder.code("\\n".join(self.lines[-self.max_lines:]), language=None)
+
+
 st.set_page_config(page_title="NSW Hansard Research Tool", page_icon="🏛️", layout="wide")
 st.title("NSW Hansard Research Tool")
 st.caption("Configure the search, run the Hansard scraper, and download an Excel workbook.")
@@ -135,9 +161,16 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
         ]
         chosen.to_csv(mps_path, index=False)
         log_stream = io.StringIO()
-        status = st.status("Connecting to the NSW Parliament Hansard API…", expanded=True)
+        status = st.status("Starting Hansard search… live progress will appear below.", expanded=True)
+        st.caption(
+            "Large searches can take several minutes. The live log below shows which MP is being "
+            "searched and whether fragments are being downloaded. If the log stops on an API request, "
+            "check the deployment logs for a timeout or API error."
+        )
+        live_log_area = st.empty()
+        live_log = LiveLog(live_log_area)
         try:
-            with contextlib.redirect_stdout(log_stream):
+            with contextlib.redirect_stdout(live_log):
                 run_scraper(
                     start=start_date.isoformat(),
                     end=end_date.isoformat(),
@@ -148,6 +181,8 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                     keywords=keywords,
                     max_workers=max_workers,
                 )
+            live_log.flush()
+            log_stream.write("\\n".join(live_log.lines))
             status.update(label="Search complete", state="complete", expanded=False)
             df = pd.read_csv(quotes_path) if quotes_path.exists() else pd.DataFrame()
             audit_df = pd.read_csv(audit_path) if audit_path.exists() and include_audit else pd.DataFrame()
@@ -181,10 +216,10 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                 use_container_width=True,
             )
             with st.expander("Run log and diagnostics"):
-                st.text(log_stream.getvalue()[-20000:] or "No log output captured.")
+                st.text("\\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
         except Exception as exc:
             status.update(label="Search failed", state="error", expanded=True)
             st.error("The scraper encountered an error. Review the details below.")
             st.exception(exc)
             with st.expander("Captured run log"):
-                st.text(log_stream.getvalue()[-20000:] or "No log output captured.")
+                st.text("\\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
