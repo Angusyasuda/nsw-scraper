@@ -3,6 +3,7 @@ from pathlib import Path
 import contextlib
 import io
 import tempfile
+import re
 
 import pandas as pd
 import streamlit as st
@@ -15,47 +16,64 @@ from hansard_scraper import (
 )
 
 
-class LiveLog:
-    """Show readable, frequently refreshed scraper output in Streamlit."""
-    def __init__(self, placeholder, max_lines=35):
+class ModernProgressUI:
+    """Intercepts terminal output to drive native Streamlit UI elements."""
+    def __init__(self, placeholder):
         self.placeholder = placeholder
-        self.max_lines = max_lines
-        self.buffer = ""
-        self.lines = []
-
-    def _render(self):
-        visible = self.lines[-self.max_lines:]
-        if self.buffer:
-            visible = (visible + [self.buffer])[-self.max_lines:]
-        self.placeholder.code("\n".join(visible) or "Waiting for scraper output…", language=None)
+        self.progress_bar = self.placeholder.progress(0.0, text="Initializing search...")
+        self.status_text = self.placeholder.empty()
+        self.log_lines = []
+        self.current_line = ""
 
     def write(self, text):
         if not text:
             return 0
-        
-        # Streamlit's code display must receive real newlines, not literal \n text.
-        text_str = str(text).replace("\\n", "\n")
-        parts = text_str.split("\n")
-        
-        for i, part in enumerate(parts):
-            if "\r" in part:
-                # \r means return to the start of the line. 
-                # We overwrite the buffer with whatever comes after the last \r
-                self.buffer = part.split("\r")[-1]
-            else:
-                self.buffer += part
             
-            # If this is not the last chunk, it means there was a \n
-            if i < len(parts) - 1:
-                self.lines.append(self.buffer)
-                self.buffer = ""
-                
-        # Refresh even for progress messages
-        self._render()
+        # Standardize newlines
+        text_str = str(text).replace("\\n", "\n")
+        
+        for char in text_str:
+            if char == '\n' or char == '\r':
+                if self.current_line:
+                    # Remove terminal color codes (ANSI escapes)
+                    clean_line = re.sub(r'\x1b\[.*?m', '', self.current_line).strip()
+                    
+                    if clean_line:
+                        self.log_lines.append(clean_line)
+                        
+                        # 1. Look for progress numbers like [260/462] or 45%
+                        fraction = re.search(r'(\d+)\s*/\s*(\d+)', clean_line)
+                        percent = re.search(r'(\d{1,3})%', clean_line)
+                        
+                        pct = None
+                        if fraction:
+                            c, t = int(fraction.group(1)), int(fraction.group(2))
+                            if t > 0 and c <= t:
+                                pct = c / t
+                        elif percent:
+                            pct = int(percent.group(1)) / 100.0
+                            
+                        # Update the Streamlit Progress Bar
+                        if pct is not None:
+                            pct = max(0.0, min(float(pct), 1.0)) # Keep between 0 and 1
+                            self.progress_bar.progress(pct, text="Scraping in progress...")
+                            
+                        # 2. Update the text label (only if it contains letters, ignoring pure progress bars)
+                        if re.search(r'[a-zA-Z]', clean_line):
+                            self.status_text.caption(f"🔄 {clean_line[:120]}")
+                            
+                # Reset line buffer on \n or \r
+                self.current_line = ""
+            else:
+                self.current_line += char
+
         return len(text)
 
     def flush(self):
-        self._render()
+        pass
+        
+    def get_logs(self):
+        return "\n".join(self.log_lines)
 
 
 st.set_page_config(page_title="NSW Hansard Research Tool", page_icon="🏛️", layout="wide")
@@ -155,7 +173,7 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
              disabled=(not selected_names or not chambers)):
     direct = [x.strip() for x in direct_text.splitlines() if x.strip()] if use_direct else []
     euphemisms = [x.strip() for x in euphemism_text.splitlines() if x.strip()] if use_euphemisms else []
-    # De-duplicate case-insensitively while preserving the first occurrence and category.
+    
     keywords, seen = [], set()
     for phrase, kind in [(x, "direct") for x in direct] + [(x, "euphemism") for x in euphemisms]:
         key = phrase.casefold()
@@ -172,23 +190,20 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
         mps_path = temp / "selected_mps.csv"
         quotes_path = temp / "wage_quotes.csv"
         audit_path = temp / "speaker_label_audit.csv"
-        # Write only selected MPs; the scraper also receives the selected names for safety.
+        
         chosen = mp_df[mp_df["search_name"].isin(selected_names)][
             ["search_name", "last_name", "chamber", "role_notes"]
         ]
         chosen.to_csv(mps_path, index=False)
-        log_stream = io.StringIO()
-        status = st.status("Starting Hansard search… live progress will appear below.", expanded=True)
-        st.caption(
-            "Large searches can take several minutes. The live log below shows which MP is being "
-            "searched and whether fragments are being downloaded. If the log stops on an API request, "
-            "check the deployment logs for a timeout or API error."
-        )
-        live_log_area = st.empty()
-        live_log = LiveLog(live_log_area)
+        
+        # --- NEW UI CONTAINER ---
+        st.markdown("---")
+        ui_container = st.container()
+        progress_ui = ModernProgressUI(ui_container)
+        
         try:
-            # Capturing both stdout and stderr (where progress bars usually print)
-            with contextlib.redirect_stdout(live_log), contextlib.redirect_stderr(live_log):
+            # Capture both stdout and stderr (where progress bars print) to our new UI
+            with contextlib.redirect_stdout(progress_ui), contextlib.redirect_stderr(progress_ui):
                 run_scraper(
                     start=start_date.isoformat(),
                     end=end_date.isoformat(),
@@ -199,11 +214,14 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                     keywords=keywords,
                     max_workers=max_workers,
                 )
-            live_log.flush()
-            log_stream.write("\n".join(live_log.lines))
-            status.update(label="Search complete", state="complete", expanded=False)
+                
+            # Finish up UI
+            progress_ui.progress_bar.progress(1.0, text="Search complete!")
+            progress_ui.status_text.caption("✅ Done.")
+            
             df = pd.read_csv(quotes_path) if quotes_path.exists() else pd.DataFrame()
             audit_df = pd.read_csv(audit_path) if audit_path.exists() and include_audit else pd.DataFrame()
+            
             if df.empty:
                 st.warning("The scraper completed but found no matching quotes for these settings.")
             else:
@@ -211,7 +229,7 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                 if show_preview:
                     st.dataframe(df.head(100), use_container_width=True, hide_index=True)
 
-            # Deliver a single Excel workbook with quote results, settings, and optional audit.
+            # Deliver Excel workbook
             excel_buffer = io.BytesIO()
             settings_df = pd.DataFrame({
                 "Setting": ["Start date", "End date", "MPs searched", "Chambers", "Direct keywords enabled",
@@ -226,6 +244,7 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                 keyword_df.to_excel(writer, sheet_name="Keywords used", index=False)
                 if not audit_df.empty:
                     audit_df.to_excel(writer, sheet_name="Speaker audit", index=False)
+                    
             st.download_button(
                 "Download Excel workbook (.xlsx)",
                 data=excel_buffer.getvalue(),
@@ -233,11 +252,14 @@ if st.button("Generate spreadsheet", type="primary", use_container_width=True,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-            with st.expander("Run log and diagnostics"):
-                st.text("\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
+            
+            with st.expander("View detailed scraper logs (for debugging)"):
+                st.text(progress_ui.get_logs()[-20000:] or "No log output captured.")
+                
         except Exception as exc:
-            status.update(label="Search failed", state="error", expanded=True)
+            progress_ui.progress_bar.progress(1.0, text="Search failed.")
+            progress_ui.status_text.caption("❌ Error occurred.")
             st.error("The scraper encountered an error. Review the details below.")
             st.exception(exc)
             with st.expander("Captured run log"):
-                st.text("\n".join(live_log.lines)[-20000:] or log_stream.getvalue()[-20000:] or "No log output captured.")
+                st.text(progress_ui.get_logs()[-20000:] or "No log output captured.")
