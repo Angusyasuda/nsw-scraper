@@ -33,7 +33,7 @@ class LiveLog:
         if not text:
             return 0
         # Streamlit's code display must receive real newlines, not literal \n text.
-        self.buffer += str(text).replace("\r", "")
+        self.buffer += str(text).replace("\\n", "\n").replace("\r", "")
         parts = self.buffer.split("\n")
         self.lines.extend(parts[:-1])
         self.buffer = parts[-1]
